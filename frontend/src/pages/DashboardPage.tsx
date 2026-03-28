@@ -4,45 +4,53 @@ import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } fro
 // Streams text character-by-character, mimicking ChatGPT / Claude / Gemini.
 // Speed is adaptive: fast at start, settles to ~18ms/char for natural pacing.
 
-function useTypewriter(text: string, active: boolean, onTick?: () => void) {
+function useTypewriter(text: string, active: boolean, onTick?: () => void, onComplete?: () => void) {
   const [displayed, setDisplayed] = useState(active ? '' : text)
   const indexRef = useRef(active ? 0 : text.length)
   const rafRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const completionSentRef = useRef(false)
 
   useEffect(() => {
+    completionSentRef.current = false
     if (!active) { setDisplayed(text); indexRef.current = text.length; return }
     indexRef.current = 0
     setDisplayed('')
 
+    const markCompleted = () => {
+      if (completionSentRef.current) return
+      completionSentRef.current = true
+      onComplete?.()
+    }
+
     const tick = () => {
-      if (indexRef.current >= text.length) return
+      if (indexRef.current >= text.length) { markCompleted(); return }
       // Chunk 1-3 chars per frame so very long messages don't drag
       const chunkSize = indexRef.current < 60 ? 1 : 2
       indexRef.current = Math.min(indexRef.current + chunkSize, text.length)
       setDisplayed(text.slice(0, indexRef.current))
       onTick?.()
+      if (indexRef.current >= text.length) { markCompleted(); return }
       rafRef.current = setTimeout(tick, indexRef.current < 60 ? 14 : 10)
     }
 
     rafRef.current = setTimeout(tick, 60) // small initial delay feels natural
     return () => { if (rafRef.current) clearTimeout(rafRef.current) }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [text, active])
+  }, [text, active, onTick, onComplete])
 
   return displayed
 }
 
 // ─── Streaming text bubble ────────────────────────────────────────────────────
 
-function StreamingText({ content, active, onTick }: { content: string; active: boolean; onTick?: () => void }) {
-  const displayed = useTypewriter(content, active, onTick)
+function StreamingText({ content, active, onTick, onComplete }: { content: string; active: boolean; onTick?: () => void; onComplete?: () => void }) {
+  const displayed = useTypewriter(content, active, onTick, onComplete)
   return (
-    <>
+    <span style={{ whiteSpace: 'pre-wrap' }}>
       {displayed}
       {active && displayed.length < content.length && (
         <span style={{ display: 'inline-block', width: 2, height: '1em', background: '#181D1F', marginLeft: 2, verticalAlign: 'text-bottom', animation: 'kavi-cursor-blink 0.8s step-end infinite' }} />
       )}
-    </>
+    </span>
   )
 }
 import { AnimatePresence, motion } from 'framer-motion'
@@ -76,9 +84,9 @@ interface StructuredAnswer { title?: string; summary?: string; sections?: Struct
 interface ChatEntry { role: 'user' | 'assistant'; content: string; structured?: StructuredAnswer | null }
 interface ChatSource { [key: string]: unknown }
 interface ChatQueryResponse { answer?: string; answer_structured?: StructuredAnswer | null; sources?: ChatSource[]; context?: ChatSource[]; mode?: ChatMode }
-interface WorkspaceRenderProps { repoId: string; repositoryName: string; messages: ChatEntry[]; chatLoading: boolean; chatInput: string; setChatInput: (v: string) => void; chatSources: ChatSource[]; entries: any[]; files: any[]; entriesLoading: boolean; entriesError: Error | null; filesLoading: boolean; filesError: Error | null; noPrContext: boolean; onSend: (input: string) => void; messagesEndRef: RefObject<HTMLDivElement>; streamingIndex: number | null }
+interface WorkspaceRenderProps { repoId: string; repositoryName: string; messages: ChatEntry[]; chatLoading: boolean; chatInput: string; setChatInput: (v: string) => void; chatSources: ChatSource[]; entries: any[]; files: any[]; entriesLoading: boolean; entriesError: Error | null; filesLoading: boolean; filesError: Error | null; noPrContext: boolean; onSend: (input: string) => void; messagesEndRef: RefObject<HTMLDivElement>; streamingIndex: number | null; onAssistantStreamComplete: (index: number) => void }
 interface WorkspaceOverlayProps { repoId: string; repositoryName: string; entries: any[]; files: any[]; chatSources: ChatSource[]; entriesLoading: boolean; entriesError: Error | null; filesLoading: boolean; filesError: Error | null; onNavigate?: () => void }
-interface DashboardChatPaneProps { messages: ChatEntry[]; chatLoading: boolean; chatInput: string; setChatInput: (v: string) => void; noPrContext: boolean; onSend: (input: string) => void; messagesEndRef: RefObject<HTMLDivElement>; streamingIndex: number | null }
+interface DashboardChatPaneProps { messages: ChatEntry[]; chatLoading: boolean; chatInput: string; setChatInput: (v: string) => void; noPrContext: boolean; onSend: (input: string) => void; messagesEndRef: RefObject<HTMLDivElement>; streamingIndex: number | null; onAssistantStreamComplete: (index: number) => void }
 
 type WorkspacePanelId = 'repository' | 'focus' | 'prs' | 'files'
 
@@ -339,11 +347,45 @@ function WorkspaceOverlayPanel({ panel, repoId, repositoryName, entries, files, 
 
 // ─── Chat pane ────────────────────────────────────────────────────────────────
 
-function DashboardChatPane({ messages, chatLoading, chatInput, setChatInput, noPrContext, onSend, messagesEndRef, streamingIndex }: DashboardChatPaneProps) {
+function DashboardChatPane({ messages, chatLoading, chatInput, setChatInput, noPrContext, onSend, messagesEndRef, streamingIndex, onAssistantStreamComplete }: DashboardChatPaneProps) {
+  const messagesContainerRef = useRef<HTMLDivElement>(null)
+  const assistantMessageRefs = useRef<Record<number, HTMLElement | null>>({})
+
+  const scrollToAssistantStart = useCallback((index: number, behavior: ScrollBehavior = 'smooth') => {
+    const node = assistantMessageRefs.current[index]
+    if (!node) return
+    node.scrollIntoView({ behavior, block: 'start', inline: 'nearest' })
+  }, [])
+
+  const followAssistantStream = useCallback((index: number) => {
+    const container = messagesContainerRef.current
+    const node = assistantMessageRefs.current[index]
+    if (!container || !node) return
+
+    const containerRect = container.getBoundingClientRect()
+    const nodeRect = node.getBoundingClientRect()
+    const topPadding = 12
+    const bottomPadding = 40
+
+    if (nodeRect.top < containerRect.top + topPadding) {
+      container.scrollTop += nodeRect.top - (containerRect.top + topPadding)
+      return
+    }
+
+    if (nodeRect.bottom > containerRect.bottom - bottomPadding) {
+      container.scrollTop += nodeRect.bottom - (containerRect.bottom - bottomPadding)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (streamingIndex === null) return
+    scrollToAssistantStart(streamingIndex, 'smooth')
+  }, [scrollToAssistantStart, streamingIndex])
+
   return (
     <section style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, background: '#F4F4F5', borderRadius: 24, border: '1px solid #E7E7E9', overflow: 'hidden' }}>
       {/* Messages */}
-      <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '20px 20px 8px', display: 'flex', flexDirection: 'column', gap: 12, scrollbarWidth: 'none' }}>
+      <div ref={messagesContainerRef} style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '20px 20px 8px', display: 'flex', flexDirection: 'column', gap: 12, scrollbarWidth: 'none' }}>
 
         {noPrContext && (
           <div style={{ borderRadius: 16, border: '1px solid #E7E7E9', background: '#fff', padding: '14px 18px' }}>
@@ -354,12 +396,17 @@ function DashboardChatPane({ messages, chatLoading, chatInput, setChatInput, noP
 
         {messages.map((message, index) => {
           const isStreaming = message.role === 'assistant' && index === streamingIndex
+          const useStreamingRenderer = message.role === 'assistant' && isStreaming
           return (
             <motion.article
               key={`${message.role}-${index}`}
               initial={{ opacity: 0, y: 8 }}
               animate={{ opacity: 1, y: 0 }}
               transition={{ type: 'spring', stiffness: 220, damping: 26 }}
+              ref={(node) => {
+                if (message.role !== 'assistant') return
+                assistantMessageRefs.current[index] = node
+              }}
               style={{ display: 'flex', justifyContent: message.role === 'user' ? 'flex-end' : 'flex-start' }}
             >
               <div style={{
@@ -374,10 +421,19 @@ function DashboardChatPane({ messages, chatLoading, chatInput, setChatInput, noP
                   : { background: '#fff', color: '#181D1F', border: '1px solid #E7E7E9', boxShadow: '0 2px 8px rgba(24,29,31,0.06)' }
                 ),
               }}>
-                {message.role === 'assistant' && message.structured
+                {useStreamingRenderer
+                  ? (
+                    <StreamingText
+                      content={message.content}
+                      active
+                      onTick={() => followAssistantStream(index)}
+                      onComplete={() => onAssistantStreamComplete(index)}
+                    />
+                  )
+                  : message.role === 'assistant' && message.structured
                   ? <StructuredAssistantBody content={message.content} structured={message.structured} />
                   : message.role === 'assistant'
-                    ? <StreamingText content={message.content} active={isStreaming} onTick={() => messagesEndRef.current?.scrollIntoView({ block: 'end' })} />
+                    ? <span style={{ whiteSpace: 'pre-wrap' }}>{message.content}</span>
                     : message.content}
               </div>
             </motion.article>
@@ -472,6 +528,7 @@ function DashboardWorkspaceV2(props: WorkspaceRenderProps) {
             onSend={props.onSend}
             messagesEndRef={props.messagesEndRef}
             streamingIndex={props.streamingIndex}
+            onAssistantStreamComplete={props.onAssistantStreamComplete}
           />
         </div>
 
@@ -614,6 +671,9 @@ export function DashboardPage() {
   const entries = useMemo(() => entriesData?.entries ?? [], [entriesData])
   const repositoryName = useMemo(() => { const fn = repositoryStatus?.repository?.full_name; return typeof fn === 'string' && fn.trim() ? fn : 'Selected repository' }, [repositoryStatus])
   const noPrContext = !filesLoading && !entriesLoading && !filesError && !entriesError && entries.length === 0 && files.length === 0
+  const handleAssistantStreamComplete = useCallback((index: number) => {
+    setStreamingIndex((current) => (current === index ? null : current))
+  }, [])
 
   const handleSend = async (input: string) => {
     if (!repoId || !input.trim()) return
@@ -639,14 +699,12 @@ export function DashboardPage() {
       if (Array.isArray(data.sources)) setChatSources(data.sources)
       else if (Array.isArray(data.context)) setChatSources(data.context)
       else setChatSources([])
-      scrollToLatestMessage('smooth')
     } catch {
       setMessages((prev) => {
         const next = [...prev, { role: 'assistant' as const, content: 'An error occurred while processing your query.' }]
         setStreamingIndex(next.length - 1)
         return next
       })
-      scrollToLatestMessage('smooth')
     } finally { setChatLoading(false) }
   }
 
@@ -681,6 +739,7 @@ export function DashboardPage() {
       onSend={handleSend}
       messagesEndRef={messagesEndRef}
       streamingIndex={streamingIndex}
+      onAssistantStreamComplete={handleAssistantStreamComplete}
     />
   )
 }
