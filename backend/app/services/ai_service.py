@@ -16,6 +16,17 @@ logger = logging.getLogger(__name__)
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
 _WORD_RE = re.compile(r"[a-zA-Z0-9_]{3,}")
 _PATH_RE = re.compile(r"(?:[A-Za-z0-9_.-]+/){2,}[A-Za-z0-9_.-]+")
+_TRAILING_COMMA_RE = re.compile(r",\s*([}\]])")
+_UNICODE_QUOTE_TRANSLATION = str.maketrans(
+    {
+        "\u2018": "'",
+        "\u2019": "'",
+        "\u201c": '"',
+        "\u201d": '"',
+        "\u00ab": '"',
+        "\u00bb": '"',
+    }
+)
 
 
 class RetryableAIError(Exception):
@@ -89,6 +100,23 @@ def _looks_general_query(
     if any(lowered.startswith(starter) for starter in general_starters):
         return True
     return overlap == 0 and len(query_terms) >= 2
+
+
+def _looks_like_json_parse_error(error: Exception) -> bool:
+    if isinstance(error, json.JSONDecodeError):
+        return True
+    lowered = str(error or "").lower()
+    indicators = (
+        "json",
+        "expecting",
+        "delimiter",
+        "unterminated",
+        "property name enclosed in double quotes",
+        "extra data",
+        "line ",
+        " char ",
+    )
+    return any(token in lowered for token in indicators)
 
 
 class AIService:
@@ -165,7 +193,7 @@ class AIService:
             logger.warning("Gemini structured chat failed; using fallback response: %s", exc)
             fallback_reason = (
                 "structured_parse_failed"
-                if "json" in str(exc).lower() or "object" in str(exc).lower()
+                if _looks_like_json_parse_error(exc) or "object" in str(exc).lower()
                 else "ai_provider_unavailable"
             )
             return self._fallback_chat_payload(
@@ -717,7 +745,34 @@ class AIService:
             max_output_tokens=1300,
             response_mime_type="application/json",
         )
-        return self._extract_json_object(repaired)
+        try:
+            return self._extract_json_object(repaired)
+        except Exception as first_error:
+            second_repair_prompt = (
+                "The attempted JSON below is invalid. Return STRICT VALID JSON ONLY with this exact schema:\n"
+                "{\n"
+                '  "title": "short title",\n'
+                '  "summary": "2-4 sentence summary",\n'
+                '  "sections": [{"heading":"...", "bullets":["...", "..."]}],\n'
+                '  "code_references": [{"file_path":"...", "start_line": null, "end_line": null, "pr_number": null, "note":"..."}],\n'
+                '  "timeline_highlights": [{"label":"...", "detail":"..."}],\n'
+                '  "limitations": ["..."]\n'
+                "}\n"
+                "Rules:\n"
+                "- Use double quotes for all keys and string values.\n"
+                "- Do not include trailing commas.\n"
+                "- Do not include markdown or commentary.\n"
+                "- If unknown, use empty strings/arrays.\n\n"
+                f"PARSER_ERROR:\n{str(first_error)[:500]}\n\n"
+                f"INVALID_JSON_ATTEMPT:\n{str(repaired or '')[:18000]}"
+            )
+            repaired_second = self._call_gemini(
+                second_repair_prompt,
+                temperature=0.0,
+                max_output_tokens=1300,
+                response_mime_type="application/json",
+            )
+            return self._extract_json_object(repaired_second)
 
     def _normalize_summary(self, parsed: dict[str, Any], pr_payload: dict[str, Any]) -> dict[str, Any]:
         fallback = self._fallback_summary(pr_payload)
@@ -1033,25 +1088,85 @@ class AIService:
         fenced = _JSON_FENCE_RE.search(text)
         if fenced:
             text = fenced.group(1).strip()
-
-        try:
-            parsed = json.loads(text)
-            if isinstance(parsed, dict):
-                return parsed
-            if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
-                return parsed[0]
-        except json.JSONDecodeError:
-            pass
-
+        candidates: list[str] = [text]
         start = text.find("{")
         end = text.rfind("}")
-        if start == -1 or end == -1 or end <= start:
-            raise ValueError("Gemini response did not include JSON object")
+        if start != -1 and end != -1 and end > start:
+            candidates.append(text[start : end + 1])
+        candidates.extend(self._extract_balanced_json_candidates(text))
 
-        parsed = json.loads(text[start : end + 1])
-        if not isinstance(parsed, dict):
-            raise ValueError("Gemini JSON response was not an object")
-        return parsed
+        seen: set[str] = set()
+        parse_errors: list[Exception] = []
+        for candidate in candidates:
+            normalized = str(candidate or "").strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            try:
+                return self._parse_json_candidate(normalized)
+            except Exception as exc:
+                parse_errors.append(exc)
+
+        if parse_errors:
+            raise parse_errors[-1]
+        raise ValueError("Gemini response did not include JSON object")
+
+    def _parse_json_candidate(self, text: str) -> dict[str, Any]:
+        variants = [text]
+        cleaned = text.lstrip("\ufeff").replace("\x00", "").strip()
+        if cleaned != text:
+            variants.append(cleaned)
+
+        ascii_quotes = cleaned.translate(_UNICODE_QUOTE_TRANSLATION)
+        if ascii_quotes and ascii_quotes not in variants:
+            variants.append(ascii_quotes)
+
+        no_trailing_commas = _TRAILING_COMMA_RE.sub(r"\1", ascii_quotes)
+        if no_trailing_commas and no_trailing_commas not in variants:
+            variants.append(no_trailing_commas)
+
+        for variant in variants:
+            try:
+                parsed = json.loads(variant)
+                if isinstance(parsed, dict):
+                    return parsed
+                if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+                    return parsed[0]
+            except json.JSONDecodeError:
+                continue
+
+        # Bubble the last parse failure with a clear message.
+        json.loads(variants[-1])
+        raise ValueError("Gemini JSON response was not an object")
+
+    def _extract_balanced_json_candidates(self, text: str) -> list[str]:
+        candidates: list[str] = []
+        in_string = False
+        escape_next = False
+        depth = 0
+        start_idx: int | None = None
+
+        for idx, ch in enumerate(text):
+            if ch == '"' and not escape_next:
+                in_string = not in_string
+
+            if not in_string:
+                if ch == "{":
+                    if depth == 0:
+                        start_idx = idx
+                    depth += 1
+                elif ch == "}" and depth > 0:
+                    depth -= 1
+                    if depth == 0 and start_idx is not None:
+                        candidates.append(text[start_idx : idx + 1])
+                        start_idx = None
+
+            if ch == "\\" and not escape_next:
+                escape_next = True
+            else:
+                escape_next = False
+
+        return candidates
 
     def _compact_sources(self, context_sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
         compact: list[dict[str, Any]] = []
